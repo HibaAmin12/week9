@@ -1,0 +1,17 @@
+# Core LangChain RAG pipeline
+langchain-core
+langchain-openai
+langchain-community
+langchain-text-splitters
+
+# Vector search
+faiss-cpu
+
+# Document loading (PDF support)
+pymupdf
+
+# Embeddings and cross-encoder reranking
+sentence-transformers
+
+# Environment variables
+python-dotenv
