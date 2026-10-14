@@ -1,0 +1,1 @@
+{"embed_tokens": 8385, "embed_cost": 0.0001677, "rerank_tokens": 6508, "rerank_cost": 0.0, "input_tokens": 32745, "input_cost": 0.0032745, "output_tokens": 3182, "output_cost": 0.0015910000000000002, "total_cost": 0.0050332, "requests": 7}

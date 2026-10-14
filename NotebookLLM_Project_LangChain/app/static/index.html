@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NotebookRAG</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<!-- ===== HEADER: logo, notebook title, notebook switcher, cost, reset / clear chat ===== -->
+<header>
+  <div class="logo" aria-hidden="true">N</div>
+  <h1 id="title">Hiba's Notebook</h1>
+  <div class="dd" id="dd">
+    <button id="ddBtn" aria-haspopup="true" aria-expanded="false" title="Switch notebook"><span id="nbname">Loading…</span> ▾</button>
+    <div id="ddMenu"></div>
+  </div>
+  <div class="grow"></div>
+  <div id="sess" title="Cost of this notebook"></div>
+  <button class="link" id="resetCost">Reset</button>
+  <button class="link" id="clearChat">Clear chat</button>
+</header>
+
+<!-- ===== MAIN: three columns ===== -->
+<main id="app">
+
+  <!-- ----- LEFT: Sources (list of files + source viewer) ----- -->
+  <section class="side" aria-label="Sources">
+    <div id="srcList" style="display:flex;flex-direction:column;min-height:0;flex:1">
+      <h2>Sources</h2>
+      <div class="pad">
+        <button class="add" id="addBtn">+ Add sources</button>
+        <div class="mute" id="embinfo" style="font-size:11px;margin:-4px 0 8px;text-align:center"></div>
+        <div id="stale"></div>
+        <div class="selall"><label for="all">Select all</label><input type="checkbox" id="all" checked></div>
+        <div id="docs"></div>
+      </div>
+    </div>
+
+    <!-- Source viewer: replaces the list when a source or citation is opened -->
+    <div id="viewer">
+      <div class="vh"><button class="x" style="opacity:1;font-size:20px" id="back" aria-label="Back to sources">‹</button><span class="mute">Sources</span></div>
+      <div id="vname"></div><div id="vnote" class="mute" style="padding:0 16px 8px;font-size:12px"></div><div id="vbody"></div>
+    </div>
+  </section>
+
+  <!-- ----- CENTRE: Chat ----- -->
+  <section class="center" aria-label="Chat">
+    <div id="chat"><div class="wrap" id="msgs"></div></div>
+    <div class="bar"><textarea id="q" rows="1" placeholder="Ask a question or create something"></textarea><span class="mute" id="nsrc">0 sources</span><button id="send" aria-label="Send">↑</button></div>
+    <div class="disc">NotebookRAG can make mistakes, so double-check it.</div>
+  </section>
+
+  <!-- ----- RIGHT: Studio (quick tools + notes) ----- -->
+  <section class="side" aria-label="Studio">
+    <h2>Studio</h2>
+    <div class="pad"><div class="tools" id="tools"></div><div id="notes"></div></div>
+    <button class="pill" id="addNote">Add note</button>
+  </section>
+</main>
+
+<!-- ===== CITATION POPOVER: shown when hovering a [n] reference ===== -->
+<div id="pop"><b id="pt"></b><p id="pp"></p><button id="pv">View source</button></div>
+
+<!-- ===== ADD SOURCES POPUP ===== -->
+<div id="modal" role="dialog" aria-modal="true" aria-label="Add sources"><div class="box" style="position:relative">
+  <button class="x" id="mx" style="opacity:1;position:absolute;right:16px;top:12px;font-size:24px" aria-label="Close">×</button>
+  <h3>Add sources</h3>
+  <button class="pri" id="upBtn" style="display:block;margin:0 auto 14px">Upload files</button>
+  <div id="drop" tabindex="0">Drag &amp; drop your files here to upload<br><small>PDF, Word, PowerPoint, Excel, CSV, Markdown, text, JSON, images (PNG, JPG)</small></div>
+</div></div>
+
+<!-- ===== SCRIPT ===== -->
+<script>
+const $=s=>document.querySelector(s);
+const st={nid:null,docs:[],sel:new Set(),up:[],notes:[],busy:false};
+const money=v=>'$'+(v>0&&v<0.0001?v.toFixed(8):v>0&&v<0.01?v.toFixed(6):v.toFixed(4));
+const num=v=>Number(v||0).toLocaleString();
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const store={get(k,d){try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
+const JH={'Content-Type':'application/json'};
+async function api(u,o){const r=await fetch(u,o);const j=await r.json().catch(()=>({error:'Bad response from server'}));if(!r.ok)throw new Error(j.error||r.statusText);return j}
+const B=()=>'/api/notebooks/'+st.nid;
+const HELLO='<div class="hello"><h1>Let\'s start your notebook…</h1><p class="mute">Add sources on the left, then ask a question. Every answer shows its sources and what it cost.</p></div>';
+
+/* ---------- notebooks dropdown ---------- */
+let books=[];
+const closeMenu=()=>{$('#ddMenu').style.display='none';$('#ddBtn').setAttribute('aria-expanded','false')};
+function renderMenu(){
+  const m=$('#ddMenu');m.innerHTML='';
+  books.forEach(n=>{
+    const b=document.createElement('button');b.className='ddi'+(n.id===st.nid?' cur':'');
+    b.innerHTML=`<span>${n.id===st.nid?'✓ ':''}${esc(n.name)}</span><small>${n.n_docs} source${n.n_docs==1?'':'s'} · ${money(n.total_cost)}</small>`;
+    b.onclick=()=>{closeMenu();if(n.id!==st.nid)openNotebook(n.id)};m.appendChild(b)});
+  m.insertAdjacentHTML('beforeend','<hr>');
+  [['+ Create notebook',createNb],['Rename this notebook',renameNb],['Delete this notebook',deleteNb]].forEach(([t,f])=>{
+    const b=document.createElement('button');b.className='ddi act';b.textContent=t;b.onclick=()=>{closeMenu();f()};m.appendChild(b)});
+}
+$('#ddBtn').onclick=async e=>{
+  e.stopPropagation();const m=$('#ddMenu');if(m.style.display==='block')return closeMenu();
+  try{books=await api('/api/notebooks')}catch(err){}
+  renderMenu();m.style.display='block';$('#ddBtn').setAttribute('aria-expanded','true');
+};
+document.addEventListener('click',e=>{if(!e.target.closest('#dd'))closeMenu()});
+async function createNb(){
+  const name=prompt('Notebook name','Untitled notebook');if(name===null)return;
+  try{const n=await api('/api/notebooks',{method:'POST',headers:JH,body:JSON.stringify({name})});await openNotebook(n.id)}catch(e){alert(e.message)}
+}
+async function renameNb(){
+  const nm=prompt('Notebook name',$('#nbname').textContent);if(!nm||!nm.trim())return;
+  try{const n=await api(B(),{method:'PATCH',headers:JH,body:JSON.stringify({name:nm})});$('#nbname').textContent=n.name}catch(e){alert(e.message)}
+}
+async function deleteNb(){
+  if(!confirm(`Delete "${$('#nbname').textContent}" and all its sources?`))return;
+  try{await api(B(),{method:'DELETE'});store.set('lastNb',null);await boot()}catch(e){alert(e.message)}
+}
+async function boot(){
+  try{
+    books=await api('/api/notebooks');
+    if(!books.length){books=[await api('/api/notebooks',{method:'POST',headers:JH,body:JSON.stringify({name:'My first notebook'})})]}
+    const last=store.get('lastNb',null);
+    await openNotebook((books.find(b=>b.id===last)||books[0]).id);
+  }catch(e){$('#msgs').innerHTML=`<p class="err">${esc(e.message)}</p>`}
+}
+async function openNotebook(id){
+  st.nid=id;store.set('lastNb',id);closeViewer();$('#msgs').innerHTML=HELLO;st.docs=[];st.sel=new Set();renderDocs();
+  try{
+    const j=await api(B());
+    $('#nbname').textContent=j.name;st.docs=j.docs;st.sel=new Set(j.docs.map(d=>d.id));
+    $('#embinfo').textContent='Embeddings: '+j.embed+(j.embed_price>0?` · ${money(j.embed_price)} per 1M tokens`:' · free (runs locally)');
+    st.notes=store.get('notes:'+id,[]);renderDocs();renderNotes();renderTotals(j.totals);renderStale(j.stale);
+    j.messages.forEach(m=>m.role==='user'?addMsg('user',esc(m.content)):botEl(m));
+  }catch(e){$('#msgs').innerHTML=`<p class="err">${esc(e.message)}</p>`}
+}
+function renderTotals(t){$('#sess').textContent=`Notebook ${money(t.total_cost||0)} · ${num(t.requests)} questions`}
+function renderStale(names){
+  const s=$('#stale');if(!names||!names.length){s.style.display='none';return}
+  s.style.display='block';s.innerHTML=`${names.length} source(s) were indexed with a different embedding model and are hidden: ${esc(names.join(', '))}. <button class="link" id="reidx">Re-index now</button>`;
+  $('#reidx').onclick=async()=>{s.textContent='Re-indexing…';try{const j=await api(B()+'/reindex',{method:'POST'});await openNotebook(st.nid);renderTotals(j.totals);addMsg('bot mute',`<p>Re-indexed ${j.reindexed} source(s): ${num(j.embed_tokens)} embedding tokens, ${money(j.embed_cost)}.</p>`)}catch(e){s.textContent=e.message}};
+}
+
+/* ---------- sources ---------- */
+function renderDocs(){
+  const box=$('#docs');box.innerHTML='';
+  st.up.forEach(n=>{const r=document.createElement('div');r.className='row';r.innerHTML=`<span class="ext">…</span><span class="nm">${esc(n)}<small>Indexing…</small></span><span class="spin"></span>`;box.appendChild(r)});
+  if(!st.docs.length&&!st.up.length)box.innerHTML='<p class="mute" style="text-align:center;padding:20px 8px">Saved sources will appear here.<br>Add a document, then ask questions about it.</p>';
+  st.docs.forEach(d=>{
+    const r=document.createElement('div');r.className='row';
+    r.innerHTML=`<span class="ext">${esc(d.ext.slice(1).toUpperCase())}</span><button class="nm" data-v title="Open source">${esc(d.name)}<small>${d.n_chunks} chunks · embedding ${num(d.embed_tokens)} tok · ${money(d.embed_cost||0)}</small></button><button class="x" aria-label="Remove ${esc(d.name)}">×</button><input type="checkbox" ${st.sel.has(d.id)?'checked':''} aria-label="Use ${esc(d.name)}">`;
+    r.querySelector('input').onchange=e=>{e.target.checked?st.sel.add(d.id):st.sel.delete(d.id);count()};
+    r.querySelector('[data-v]').onclick=()=>openViewer(d.id,d.name);
+    r.querySelector('.x').onclick=async()=>{await api(B()+'/docs/'+d.id,{method:'DELETE'});st.sel.delete(d.id);st.docs=st.docs.filter(x=>x.id!==d.id);renderDocs()};
+    box.appendChild(r)});
+  count();
+}
+function count(){const n=st.sel.size;$('#nsrc').textContent=n+(n===1?' source':' sources');$('#all').checked=n>0&&n===st.docs.length}
+$('#all').onchange=e=>{st.sel=new Set(e.target.checked?st.docs.map(d=>d.id):[]);renderDocs()};
+
+/* ---------- Add sources window ---------- */
+const OK=/\.(pdf|docx|pptx|xlsx|csv|md|txt|json|png|jpe?g)$/i;
+const picker=document.createElement('input');
+picker.type='file';picker.accept='.pdf,.docx,.pptx,.xlsx,.csv,.md,.txt,.json,.png,.jpg,.jpeg';picker.multiple=true;picker.hidden=true;document.body.appendChild(picker);
+const modal=$('#modal');
+const openModal=()=>{modal.style.display='grid'},closeModal=()=>{modal.style.display='none'};
+$('#addBtn').onclick=openModal;$('#mx').onclick=closeModal;
+modal.onclick=e=>{if(e.target===modal)closeModal()};
+$('#upBtn').onclick=()=>picker.click();
+picker.onchange=e=>{upload([...e.target.files]);e.target.value=''};
+const drop=$('#drop');
+drop.onclick=()=>picker.click();
+drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};
+drop.ondragleave=()=>drop.classList.remove('over');
+drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');upload([...e.dataTransfer.files])};
+const zone=document.querySelector('section[aria-label="Sources"]');
+zone.ondragover=e=>{e.preventDefault()};zone.ondrop=e=>{e.preventDefault();upload([...e.dataTransfer.files])};
+async function upload(files){
+  closeModal();const nid=st.nid;
+  const bad=files.filter(f=>!OK.test(f.name));
+  if(bad.length)addMsg('bot err',`<p>These file types are not supported: ${esc(bad.map(f=>f.name).join(', '))}</p>`);
+  files=files.filter(f=>OK.test(f.name));
+  for(const f of files){
+    st.up.push(f.name);renderDocs();
+    const fd=new FormData();fd.append('file',f);
+    try{
+      const j=await api(`/api/notebooks/${nid}/upload`,{method:'POST',body:fd});
+      if(st.nid===nid){st.docs.push(j.doc);st.sel.add(j.doc.id);renderTotals(j.totals)}
+    }catch(e){addMsg('bot err',`<p>${esc(e.message)}</p>`)}
+    st.up=st.up.filter(n=>n!==f.name);if(st.nid===nid)renderDocs();
+  }
+}
+
+/* ---------- chat ---------- */
+function md(t){
+  let h='',list=null;const close=()=>{if(list){h+=`</${list}>`;list=null}};
+  const dedupe=s=>s.replace(/((?:\[\d+\])+)(\s*[.,;:]?\s*)\1/g,'$1$2').replace(/\[(\d+)\](\s*)\[\1\]/g,'[$1]');
+  const inl=s=>dedupe(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/\[(\d+)\]/g,'<button class="cite" data-n="$1">$1</button>');
+  for(const l of esc(t).split('\n')){let m;
+    if(m=l.match(/^(#{1,3})\s+(.*)/)){close();const k=m[1].length+2;h+=`<h${k}>${inl(m[2])}</h${k}>`}
+    else if(m=l.match(/^\s*[-*•]\s+(.*)/)){if(list!=='ul'){close();h+='<ul>';list='ul'}h+=`<li>${inl(m[1])}</li>`}
+    else if(m=l.match(/^\s*(\d+)[.)]\s+(.*)/)){if(list!=='ol'){close();h+=`<ol start="${m[1]}">`;list='ol'}h+=`<li>${inl(m[2])}</li>`}
+    else if(!l.trim())close();else{close();h+=`<p>${inl(l)}</p>`}}
+  close();return h;
+}
+function addMsg(cls,html){
+  const hello=$('#msgs .hello');if(hello)hello.remove();
+  const d=document.createElement('div');d.className=cls;d.innerHTML=html;$('#msgs').appendChild(d);$('#chat').scrollTop=1e9;return d;
+}
+const MODE={broad:'Evenly sampled across the sources (summary-style question)',rerank:'Vector search, then reranked',vector:'Vector search'};
+function botEl(j){
+  const u=j.usage||{},text=j.answer||j.content||'';
+  const el=addMsg('bot',`<details class="th"><summary>Retrieval details</summary><div>${esc(MODE[j.mode]||j.mode||'')}<br>${(j.retrieved||[]).map(r=>`[${r.n}] ${esc(r.doc)} · ${esc(r.label)}`).join('<br>')}</div></details>${md(text)}
+    <div class="cost"><span>Embed ${num(u.embed_tokens)} tok · ${money(u.embed_cost)}</span><span>Input ${num(u.input_tokens)} tok · ${money(u.input_cost)}</span><span>Output ${num(u.output_tokens)} tok · ${money(u.output_cost)}</span><span class="tot">Total ${money(u.total_cost)}</span><span>${u.seconds}s · ${esc(u.model||'')}</span></div>
+    <div class="acts"><button data-copy>Copy</button><button data-note>Save to note</button></div>`);
+  el._c=j.citations||[];
+  el.querySelector('[data-copy]').onclick=()=>navigator.clipboard&&navigator.clipboard.writeText(text);
+  el.querySelector('[data-note]').onclick=()=>{st.notes.push(text);saveNotes()};
+  return el;
+}
+async function ask(text){
+  text=text.trim();if(st.busy||!text)return;
+  if(!st.sel.size){addMsg('bot err','<p>Tick at least one source first.</p>');return}
+  st.busy=true;$('#send').disabled=true;const nid=st.nid;
+  document.querySelectorAll('.sugs').forEach(s=>s.remove());addMsg('user',esc(text));const wait=addMsg('bot mute','Thinking…');
+  try{
+    const j=await api(`/api/notebooks/${nid}/chat`,{method:'POST',headers:JH,body:JSON.stringify({message:text,doc_ids:[...st.sel]})});
+    wait.remove();if(st.nid!==nid)return;const b=botEl(j);renderTotals(j.totals);suggest(b,text,j,nid);
+  }catch(e){wait.remove();addMsg('bot err',`<p>${esc(e.message)}</p>`)}
+  finally{st.busy=false;$('#send').disabled=false}
+}
+/* ---------- follow-up question cards under the latest answer ---------- */
+async function suggest(el,message,j,nid){
+  document.querySelectorAll('.sugs').forEach(s=>s.remove());   // only the newest answer keeps its cards
+  try{
+    const r=await api(`/api/notebooks/${nid}/suggest`,{method:'POST',headers:JH,body:JSON.stringify({
+      message,answer:j.answer||'',doc_ids:[...st.sel],passages:(j.citations||[]).slice(0,4).map(c=>c.text)})});
+    if(st.nid!==nid||!r.questions||!r.questions.length)return;
+    if(r.totals)renderTotals(r.totals);
+    const box=document.createElement('div');box.className='sugs';
+    r.questions.forEach(t=>{const b=document.createElement('button');b.className='sug';
+      b.innerHTML=`<span>${esc(t)}</span><small>↗</small>`;
+      b.onclick=()=>{box.remove();ask(t)};box.appendChild(b)});
+    el.after(box);$('#chat').scrollTop=1e9;
+  }catch(e){/* suggestions are optional: stay silent on failure */}
+}
+const q=$('#q');
+$('#send').onclick=()=>{const t=q.value;q.value='';q.style.height='';ask(t)};
+q.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#send').click()}};
+q.oninput=()=>{q.style.height='auto';q.style.height=Math.min(q.scrollHeight,120)+'px'};
+
+/* ---------- citation popover ---------- */
+const pop=$('#pop');let popT,popC;
+const hide=()=>{popT=setTimeout(()=>pop.style.display='none',250)};
+const cite=b=>(b.closest('.bot')._c||[]).find(c=>c.n==b.dataset.n);
+document.addEventListener('mouseover',e=>{
+  const b=e.target.closest('.cite');if(!b)return;const c=cite(b);if(!c)return;
+  clearTimeout(popT);popC=c;$('#pt').textContent=`${c.doc} · ${c.label}`;$('#pp').textContent=(c.segments||[{text:c.text}]).map(s=>s.text).join('\n…\n');
+  const r=b.getBoundingClientRect();pop.style.display='block';
+  pop.style.left=Math.max(8,Math.min(r.left,innerWidth-pop.offsetWidth-8))+'px';
+  pop.style.top=(r.bottom+pop.offsetHeight+12>innerHeight?Math.max(8,r.top-pop.offsetHeight-6):r.bottom+6)+'px';
+});
+document.addEventListener('mouseout',e=>{if(e.target.closest('.cite'))hide()});
+pop.onmouseenter=()=>clearTimeout(popT);pop.onmouseleave=hide;
+$('#pv').onclick=()=>{pop.style.display='none';openViewer(popC.doc_id,popC.doc,popC)};
+document.addEventListener('click',e=>{const b=e.target.closest('.cite');if(!b)return;const c=cite(b);if(c)openViewer(c.doc_id,c.doc,c)});
+
+/* ---------- source viewer (replaces the source list) ---------- */
+function closeViewer(){$('#viewer').style.display='none';$('#srcList').style.display='flex'}
+async function openViewer(id,name,hit){
+  $('#srcList').style.display='none';$('#viewer').style.display='flex';$('#vname').textContent=name;$('#vbody').textContent='Loading…';
+  $('#vnote').textContent='';
+  const units=await api(`${B()}/docs/${id}/units`);const body=$('#vbody');body.innerHTML='';let target=null;
+  units.forEach((u,i)=>{
+    const hd=document.createElement('div');hd.className='pg';hd.textContent=u.label;body.appendChild(hd);
+    const p=document.createElement('div'),t=u.text,f=new Uint8Array(t.length);
+    // only the exact evidence ranges are highlighted; no whole-passage background
+    (hit?(hit.highlight||[]).filter(r=>r.unit===i):[]).forEach(r=>f.fill(1,r.start,Math.min(r.end,t.length)));
+    for(let k=0;k<t.length;){
+      let e=k;while(e<t.length&&f[e]===f[k])e++;
+      const piece=t.slice(k,e);
+      if(f[k]){const m=document.createElement('mark');m.textContent=piece;p.appendChild(m);if(!target)target=m}
+      else p.append(piece);
+      k=e}
+    body.appendChild(p)});
+  if(target)target.scrollIntoView({block:'start'});
+}
+$('#back').onclick=closeViewer;
+
+/* ---------- studio + notes ---------- */
+const IC={Summary:'M4 6h16M4 12h16M4 18h10','Study guide':'M4 5a2 2 0 0 1 2-2h12v16H6a2 2 0 0 0-2 2zM4 5v16',FAQ:'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .8-1 1.5M12 17v.5',Timeline:'M12 3v18M12 7h6M12 12H6M12 17h6',Quiz:'M5 7l2 2 3-3M5 15l2 2 3-3M13 8h6M13 16h6',Flashcards:'M4 8h13v11H4zM8 4h13v11'};
+const P={Summary:'Write a structured summary of the selected sources.','Study guide':'Create a study guide with key concepts and review questions.',FAQ:'Write an FAQ with the 8 most useful questions and answers.',Timeline:'Build a timeline of the main events or steps.',Quiz:'Write a 6-question multiple-choice quiz with answers.',Flashcards:'Create 10 flashcards (term and definition).'};
+Object.keys(P).forEach(n=>{const b=document.createElement('button');b.className='tool';b.innerHTML=`<svg viewBox="0 0 24 24"><path d="${IC[n]}"/></svg>${n}`;b.onclick=()=>ask(P[n]);$('#tools').appendChild(b)});
+function saveNotes(){store.set('notes:'+st.nid,st.notes);renderNotes()}
+function renderNotes(){
+  $('#notes').innerHTML=st.notes.length?'':'<p class="mute" style="margin-top:16px">Use “Save to note” under an answer, or add your own.</p>';
+  st.notes.forEach((t,i)=>{const n=document.createElement('div');n.className='note';n.innerHTML=`${esc(t.slice(0,600))}<button class="x" aria-label="Delete note">×</button>`;
+    n.querySelector('.x').onclick=()=>{st.notes.splice(i,1);saveNotes()};$('#notes').appendChild(n)});
+}
+$('#addNote').onclick=()=>{const t=prompt('Note');if(t&&t.trim()){st.notes.push(t.trim());saveNotes()}};
+
+/* ---------- header actions ---------- */
+$('#resetCost').onclick=async()=>renderTotals(await api(B()+'/usage/reset',{method:'POST'}));
+$('#clearChat').onclick=async()=>{if(confirm('Clear this chat?')){await api(B()+'/messages',{method:'DELETE'});$('#msgs').innerHTML=HELLO}};
+document.onkeydown=e=>{if(e.key==='Escape'){closeModal();pop.style.display='none'}};
+boot();
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+services:
+  notebook-rag:
+    build: .
+    image: notebookllm
+    container_name: notebookllm
+    ports:
+      - "5000:5000"
+    env_file: .env
+    volumes:
+      - rag_data2:/data   # uploads, indexes and usage totals survive restarts
+    restart: unless-stopped
+
+volumes:
+  rag_data2:
+    name: rag_data2       # exact name, so it is the same volume that `docker run -v rag_data2:/data` uses
