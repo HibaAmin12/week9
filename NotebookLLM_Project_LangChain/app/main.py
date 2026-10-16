@@ -161,7 +161,8 @@ def chat(nb):
         return jsonify(out)
 
     try:
-        out = rag.answer(nb.store, message, set(body.get("doc_ids") or []), nb.history(config.HISTORY_TURNS * 2))
+        web = body.get("web") if isinstance(body.get("web"), bool) else None   # None = ask first
+        out = rag.answer(nb.store, message, set(body.get("doc_ids") or []), nb.history(config.HISTORY_TURNS * 2), web)
     except llm.LLMError as exc:
         return jsonify(error=str(exc)), 502
     except Exception as exc:
@@ -171,8 +172,10 @@ def chat(nb):
                                   rerank_tokens=u["rerank_tokens"], rerank_cost=u["rerank_cost"],
                                   input_tokens=u["input_tokens"], input_cost=u["input_cost"],
                                   output_tokens=u["output_tokens"], output_cost=u["output_cost"], requests=1)
-    nb.append({"role": "user", "content": message},
-              {"role": "assistant", "content": out["answer"], **{k: out[k] for k in ("citations", "usage", "mode", "retrieved")}})
+    saved = {k: out[k] for k in ("citations", "usage", "mode", "retrieved")}
+    if out.get("ask_web"):   # keep the Yes/No card working after a reload
+        saved.update(ask_web=True, question=out["question"])
+    nb.append({"role": "user", "content": message}, {"role": "assistant", "content": out["answer"], **saved})
     return jsonify(out)
 
 

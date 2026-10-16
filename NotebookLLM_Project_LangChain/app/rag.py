@@ -4,6 +4,7 @@ import math
 import os
 import re
 import time
+from urllib.parse import urlparse
 
 import numpy as np
 
@@ -11,7 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnablePassthrough
 
-from . import config, embeddings, llm, reranker
+from . import config, embeddings, llm, reranker, websearch
 from .costs import usd
 
 # Semantic highlight fallback: when the answer shares no words with the passage (e.g. a Roman Urdu answer about an
@@ -24,12 +25,16 @@ SEMANTIC_MAX_SENTENCES = 60
 BROAD = re.compile(r"summar|overview|study guide|\bfaq\b|timeline|quiz|flashcard|key (points|takeaways)|"
                    r"outline|main (ideas|points)|briefing|table of contents", re.I)
 
-SYSTEM = """You are a helpful assistant inside a document Q&A app. The numbered passages below come from the user's documents.
+SYSTEM = """You are a helpful assistant inside a document Q&A app. The numbered passages below come from the user's sources. There may be no passages if no source is selected.
 Rules:
 - For questions about the documents, use ONLY the passages. After every claim, cite the passage number(s) in square brackets, like [2] or [1][4]. Cite each claim once, at the end of the sentence, and never repeat the same citations.
 - A passage may include a little surrounding text; cite the passage whose words support the claim.
 - If the question is about the documents but the passages do not contain the answer, say so plainly. Never invent facts about the documents.
-- If the message is casual conversation (greetings, thanks, "who are you?") or a simple general question unrelated to the documents (like arithmetic or basic common knowledge), answer it naturally and briefly. Do not use citations for these answers, and do not claim the answer comes from the documents.
+- If no source is selected and the user asks about their documents, tell them to tick or add a source on the left. Do not answer from general knowledge in that case.
+- If the message is casual conversation (greetings, thanks, "who are you?"), answer it naturally and briefly. Do not use citations for it.
+- Simple arithmetic (like "2+2=") and small talk: answer directly. Never use the line below for these.
+- If the question asks for facts or an explanation about the world (for example "what is deep learning?") and the passages do not answer it, reply with only this line and nothing else: [NO_SOURCE_ANSWER]
+  The app then asks the user whether to search the web. Use this line only for such questions, never for questions about the user's documents.
 - For anything about health, safety, law, money or other high-stakes topics, do not answer from general knowledge. Say it is outside the documents and suggest a qualified professional.
 - Answer in English unless the user writes in another language. Be clear and concise.
 
@@ -41,6 +46,34 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
     MessagesPlaceholder("history"),
     ("human", "{question}"),
 ])
+
+GENERAL_SYSTEM = """You are a helpful assistant. Answer the user's question from general knowledge.
+Rules:
+- Begin with one short sentence that says: {lead} Write that sentence in the user's language.
+- Then answer clearly and concisely. Do not add citations.
+- For health, safety, law, money or other high-stakes topics, suggest a qualified professional.
+- Answer in English unless the user writes in another language."""
+
+WEB_SYSTEM = """You are a helpful assistant. The user's question is not answered by their sources, so the numbered web search results below were found for it.
+Rules:
+- Begin with one short sentence saying that this answer comes from a web search, not from the user's sources. Write that sentence in the user's language.
+- Use ONLY the web results for facts. After every claim, cite the result number(s) in square brackets, like [2] or [1][3].
+- If the results do not answer the question, say so plainly.
+- For health, safety, law, money or other high-stakes topics, suggest a qualified professional.
+- Answer in English unless the user writes in another language. Be clear and concise.
+
+WEB RESULTS:
+{passages}"""
+
+GENERAL_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", GENERAL_SYSTEM), MessagesPlaceholder("history"), ("human", "{question}"),
+])
+WEB_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", WEB_SYSTEM), MessagesPlaceholder("history"), ("human", "{question}"),
+])
+
+NO_SOURCE_MARKER = "[NO_SOURCE_ANSWER]"   # the model's signal: "not in the sources, this is a general question"
+NO_PASSAGES = "(No sources are selected for this question.)"
 
 
 def _search_query(message, history):
@@ -344,27 +377,33 @@ def _safe_evidence(*args):
         return None
 
 
-def answer(store, message, doc_ids, history=None):
-    t0 = time.time()
-    hits, usage, mode = retrieve(store, message, doc_ids, history)
-    if not hits:
-        return {"answer": "No indexed documents are selected. Upload a file or tick a source on the left.",
-                "citations": [], "usage": {**usage, "input_tokens": 0, "output_tokens": 0, "input_cost": 0.0,
-                                           "output_cost": 0.0, "total_cost": usage["embed_cost"], "seconds": 0},
-                "mode": mode, "retrieved": []}
-    for h in hits:  # show neighbouring text too, so explanations split across pages stay complete
-        h["segments"] = (store.expand(h, config.NEIGHBORS) if config.NEIGHBORS > 0 and mode != "broad"
-                         else [{"unit": h["unit"], "label": h["label"], "text": h["text"]}])
-        h["span"] = _label(h["segments"])
-    passages = "\n\n".join(f"[{i}] ({h['doc']}, {h['span']})\n{_passage(h['segments'])}" for i, h in enumerate(hits, 1))
-    res = llm.run(ANSWER_PROMPT, {"passages": passages, "history": _history_messages(history), "question": message})
-    used = sorted({int(n) for n in re.findall(r"\[(\d+)\]", res["text"]) if 1 <= int(n) <= len(hits)})
-    if used and _NEG.search(res["text"]):
+def _zero_usage():
+    return {"embed_tokens": 0, "embed_cost": 0.0, "rerank_tokens": 0, "rerank_cost": 0.0}
+
+
+def _finish(usage, calls, extra_tokens, t0):
+    """Add up the LLM calls of one answer (the first pass plus any fallback) and price them."""
+    usage["embed_tokens"] += extra_tokens
+    usage["embed_cost"] += usd(extra_tokens, config.EMBED_PRICE_PER_M)
+    inp = sum(c["input_tokens"] for c in calls)
+    out = sum(c["output_tokens"] for c in calls)
+    in_cost, out_cost = usd(inp, config.PRICE_IN), usd(out, config.PRICE_OUT)
+    usage.update(input_tokens=inp, output_tokens=out, input_cost=in_cost, output_cost=out_cost,
+                 model=calls[-1]["model"],
+                 total_cost=usage["embed_cost"] + usage["rerank_cost"] + in_cost + out_cost,
+                 seconds=round(time.time() - t0, 1))
+    return usage
+
+
+def _source_citations(store, hits, text, message):
+    """Map the model's [n] references to the passages they support. Returns (answer_text, citations, extra_tokens)."""
+    used = sorted({int(n) for n in re.findall(r"\[(\d+)\]", text) if 1 <= int(n) <= len(hits)})
+    if used and _NEG.search(text):
         used = []  # "the documents do not say..." -> nothing to cite
     citations, remap, extra = [], {}, 0   # extra: embedding tokens used by the semantic highlight fallback
     for n in used:
         h = hits[n - 1]
-        ev = _safe_evidence(store, h, n, res["text"], message)
+        ev = _safe_evidence(store, h, n, text, message)
         extra += (ev or {}).get("tokens", 0)
         if not ev or ev["score"] < config.CITE_DROP_SCORE:
             continue  # no overlap with the claim at all -> unrelated reference, drop it
@@ -379,20 +418,90 @@ def answer(store, message, doc_ids, history=None):
             citations.append({"n": remap[n], "label": h["label"], "segments": [{"unit": h["unit"], "label": h["label"], "text": h["text"]}],
                               "highlight": [], "doc_id": h["doc_id"], "doc": h["doc"], "unit": h["unit"], "text": h["text"]})
     answer_text = re.sub(r"\[(\d+)\]",
-                         lambda m: f"[{remap[int(m.group(1))]}]" if int(m.group(1)) in remap else "", res["text"])
+                         lambda m: f"[{remap[int(m.group(1))]}]" if int(m.group(1)) in remap else "", text)
     answer_text = re.sub(r"\s+([.,;:])", r"\1", answer_text)
+    return answer_text, citations, extra
 
-    if extra:
-        usage["embed_tokens"] += extra
-        usage["embed_cost"] += usd(extra, config.EMBED_PRICE_PER_M)
-    in_cost = usd(res["input_tokens"], config.PRICE_IN)
-    out_cost = usd(res["output_tokens"], config.PRICE_OUT)
-    usage.update(input_tokens=res["input_tokens"], output_tokens=res["output_tokens"],
-                 input_cost=in_cost, output_cost=out_cost, model=res["model"],
-                 total_cost=usage["embed_cost"] + usage["rerank_cost"] + in_cost + out_cost,
-                 seconds=round(time.time() - t0, 1))
+
+def _web_citations(results, text):
+    """Keep the [n] references that point at a web result. Returns (answer_text, citations)."""
+    used = {int(n) for n in re.findall(r"\[(\d+)\]", text) if 1 <= int(n) <= len(results)}
+    citations = []
+    for n in sorted(used):
+        r = results[n - 1]
+        host = urlparse(r["url"]).netloc
+        citations.append({"n": n, "label": host, "segments": [{"unit": 0, "label": host, "text": r["snippet"]}],
+                          "highlight": [], "doc_id": None, "doc": r["title"] or host, "unit": 0,
+                          "text": r["snippet"], "url": r["url"]})
+    answer_text = re.sub(r"\[(\d+)\]", lambda m: m.group(0) if int(m.group(1)) in used else "", text)
+    answer_text = re.sub(r"\s+([.,;:])", r"\1", answer_text)
+    return answer_text, citations
+
+
+ASK_WEB_SOURCES = "This isn't in your sources. Should I search the web for it?"
+ASK_WEB_NO_SOURCES = "No source is ticked. Should I search the web for this?"
+
+
+def _outside_sources(message, history, first, usage, t0, web, had_sources):
+    """The sources do not cover this question. Ask first (web is None); otherwise search the web when
+    asked to, or answer from general knowledge."""
+    if web is None:   # the user has not chosen yet: ask, and do not spend a search
+        return {"answer": ASK_WEB_SOURCES if had_sources else ASK_WEB_NO_SOURCES, "citations": [], "retrieved": [],
+                "usage": _finish(usage, [first], 0, t0), "mode": "ask", "ask_web": True, "question": message}
+    calls, results, note = [first], [], ""   # the first call is billed too: it produced the signal
+    if web:
+        if websearch.enabled():
+            try:
+                results = websearch.search(_search_query(message, history))
+            except websearch.WebSearchError as exc:
+                print(f"[websearch] {exc}")
+                note = "Web search failed, so this answer is from general knowledge."
+            if not results and not note:
+                note = "Web search found nothing, so this answer is from general knowledge."
+        else:
+            note = "Web search is not set up (WEB_SEARCH_PROVIDER in .env), so this answer is from general knowledge."
+    if results:
+        passages = "\n\n".join(f"[{i}] ({r['title'] or r['url']}, {r['url']})\n{r['snippet']}"
+                               for i, r in enumerate(results, 1))
+        res = llm.run(WEB_PROMPT, {"passages": passages, "history": _history_messages(history), "question": message})
+        text, citations = _web_citations(results, res["text"])
+        retrieved = [{"n": i, "doc": r["title"] or r["url"], "label": r["url"]} for i, r in enumerate(results, 1)]
+        mode = "web"
+    else:
+        if note:
+            lead = note
+        elif had_sources:
+            lead = "This is general knowledge, not from your sources."
+        else:
+            lead = "No source is ticked, so this is general knowledge."
+        res = llm.run(GENERAL_PROMPT, {"lead": lead, "question": message, "history": _history_messages(history)})
+        text, citations, retrieved, mode = res["text"], [], [], "general"
+    calls.append(res)
+    usage = _finish(usage, calls, 0, t0)
+    return {"answer": text, "citations": citations, "usage": usage, "mode": mode, "retrieved": retrieved}
+
+
+def answer(store, message, doc_ids, history=None, web=None):
+    """web: None = ask the user before any web search, True = search the web, False = no web search."""
+    t0 = time.time()
+    doc_ids = set(doc_ids or ())
+    if doc_ids:
+        hits, usage, mode = retrieve(store, message, doc_ids, history)
+    else:  # nothing ticked: skip retrieval (an empty filter must never mean "every source")
+        hits, usage, mode = [], _zero_usage(), "none"
+    for h in hits:  # show neighbouring text too, so explanations split across pages stay complete
+        h["segments"] = (store.expand(h, config.NEIGHBORS) if config.NEIGHBORS > 0 and mode != "broad"
+                         else [{"unit": h["unit"], "label": h["label"], "text": h["text"]}])
+        h["span"] = _label(h["segments"])
+    passages = ("\n\n".join(f"[{i}] ({h['doc']}, {h['span']})\n{_passage(h['segments'])}" for i, h in enumerate(hits, 1))
+                if hits else NO_PASSAGES)
+    res = llm.run(ANSWER_PROMPT, {"passages": passages, "history": _history_messages(history), "question": message})
+    if NO_SOURCE_MARKER in res["text"]:
+        return _outside_sources(message, history, res, usage, t0, web, had_sources=bool(hits))
+    text, citations, extra = _source_citations(store, hits, res["text"], message)
     retrieved = [{"n": i, "doc": h["doc"], "label": h["span"]} for i, h in enumerate(hits, 1)]
-    return {"answer": answer_text, "citations": citations, "usage": usage, "mode": mode, "retrieved": retrieved}
+    usage = _finish(usage, [res], extra, t0)
+    return {"answer": text, "citations": citations, "usage": usage, "mode": mode, "retrieved": retrieved}
 
 
 SUGGEST_SYSTEM = """You suggest follow-up questions for a document Q&A app.
@@ -430,7 +539,7 @@ def suggest(store, message, answer_text, doc_ids, passages=None):
     """Three follow-up questions grounded in the documents. Returns {"questions", "usage"}."""
     if not config.SUGGESTIONS:
         return {"questions": [], "usage": None}
-    excerpts = [t for t in (passages or []) if t] or [h["text"] for h in store.sample(doc_ids, 4)]
+    excerpts = [t for t in (passages or []) if t] or ([h["text"] for h in store.sample(doc_ids, 4)] if doc_ids else [])
     excerpts = [t[:500] for t in excerpts[:4]]
     if not excerpts:
         return {"questions": [], "usage": None}

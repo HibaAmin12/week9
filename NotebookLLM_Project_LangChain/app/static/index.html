@@ -206,25 +206,33 @@ function addMsg(cls,html){
   const hello=$('#msgs .hello');if(hello)hello.remove();
   const d=document.createElement('div');d.className=cls;d.innerHTML=html;$('#msgs').appendChild(d);$('#chat').scrollTop=1e9;return d;
 }
-const MODE={broad:'Evenly sampled across the sources (summary-style question)',rerank:'Vector search, then reranked',vector:'Vector search'};
+const MODE={broad:'Evenly sampled across the sources (summary-style question)',rerank:'Vector search, then reranked',vector:'Vector search',
+  none:'No sources ticked: answered without your documents',general:'General knowledge (not from your sources)',web:'Web search (not from your sources)',ask:'Waiting for your choice: web search or not'};
 function botEl(j){
   const u=j.usage||{},text=j.answer||j.content||'';
   const el=addMsg('bot',`<details class="th"><summary>Retrieval details</summary><div>${esc(MODE[j.mode]||j.mode||'')}<br>${(j.retrieved||[]).map(r=>`[${r.n}] ${esc(r.doc)} · ${esc(r.label)}`).join('<br>')}</div></details>${md(text)}
     <div class="cost"><span>Embed ${num(u.embed_tokens)} tok · ${money(u.embed_cost)}</span><span>Input ${num(u.input_tokens)} tok · ${money(u.input_cost)}</span><span>Output ${num(u.output_tokens)} tok · ${money(u.output_cost)}</span><span class="tot">Total ${money(u.total_cost)}</span><span>${u.seconds}s · ${esc(u.model||'')}</span></div>
     <div class="acts"><button data-copy>Copy</button><button data-note>Save to note</button></div>`);
   el._c=j.citations||[];
+  if(j.ask_web){
+    const card=document.createElement('div');card.className='acts';
+    card.innerHTML='<button data-web="1">Yes, search the web</button><button data-web="0">No, answer without web</button>';
+    card.querySelectorAll('button').forEach(b=>b.onclick=()=>{card.remove();ask(j.question,false,b.dataset.web==='1',false)});
+    el.appendChild(card);
+  }
   el.querySelector('[data-copy]').onclick=()=>navigator.clipboard&&navigator.clipboard.writeText(text);
   el.querySelector('[data-note]').onclick=()=>{st.notes.push(text);saveNotes()};
   return el;
 }
-async function ask(text){
+async function ask(text,needSources,web,echo=true){
   text=text.trim();if(st.busy||!text)return;
-  if(!st.sel.size){addMsg('bot err','<p>Tick at least one source first.</p>');return}
+  if(needSources&&!st.sel.size){addMsg('bot err','<p>Tick at least one source first.</p>');return}
   st.busy=true;$('#send').disabled=true;const nid=st.nid;
-  document.querySelectorAll('.sugs').forEach(s=>s.remove());addMsg('user',esc(text));const wait=addMsg('bot mute','Thinking…');
+  document.querySelectorAll('.sugs').forEach(s=>s.remove());if(echo)addMsg('user',esc(text));const wait=addMsg('bot mute','Thinking…');
+  const payload={message:text,doc_ids:[...st.sel]};if(web!==undefined)payload.web=web;
   try{
-    const j=await api(`/api/notebooks/${nid}/chat`,{method:'POST',headers:JH,body:JSON.stringify({message:text,doc_ids:[...st.sel]})});
-    wait.remove();if(st.nid!==nid)return;const b=botEl(j);renderTotals(j.totals);suggest(b,text,j,nid);
+    const j=await api(`/api/notebooks/${nid}/chat`,{method:'POST',headers:JH,body:JSON.stringify(payload)});
+    wait.remove();if(st.nid!==nid)return;const b=botEl(j);renderTotals(j.totals);if(!j.ask_web)suggest(b,text,j,nid);
   }catch(e){wait.remove();addMsg('bot err',`<p>${esc(e.message)}</p>`)}
   finally{st.busy=false;$('#send').disabled=false}
 }
@@ -254,15 +262,15 @@ const hide=()=>{popT=setTimeout(()=>pop.style.display='none',250)};
 const cite=b=>(b.closest('.bot')._c||[]).find(c=>c.n==b.dataset.n);
 document.addEventListener('mouseover',e=>{
   const b=e.target.closest('.cite');if(!b)return;const c=cite(b);if(!c)return;
-  clearTimeout(popT);popC=c;$('#pt').textContent=`${c.doc} · ${c.label}`;$('#pp').textContent=(c.segments||[{text:c.text}]).map(s=>s.text).join('\n…\n');
+  clearTimeout(popT);popC=c;$('#pt').textContent=`${c.doc} · ${c.label}`;$('#pv').textContent=c.url?'Open web page':'View source';$('#pp').textContent=(c.segments||[{text:c.text}]).map(s=>s.text).join('\n…\n');
   const r=b.getBoundingClientRect();pop.style.display='block';
   pop.style.left=Math.max(8,Math.min(r.left,innerWidth-pop.offsetWidth-8))+'px';
   pop.style.top=(r.bottom+pop.offsetHeight+12>innerHeight?Math.max(8,r.top-pop.offsetHeight-6):r.bottom+6)+'px';
 });
 document.addEventListener('mouseout',e=>{if(e.target.closest('.cite'))hide()});
 pop.onmouseenter=()=>clearTimeout(popT);pop.onmouseleave=hide;
-$('#pv').onclick=()=>{pop.style.display='none';openViewer(popC.doc_id,popC.doc,popC)};
-document.addEventListener('click',e=>{const b=e.target.closest('.cite');if(!b)return;const c=cite(b);if(c)openViewer(c.doc_id,c.doc,c)});
+$('#pv').onclick=()=>{pop.style.display='none';if(popC.url)window.open(popC.url,'_blank','noopener');else openViewer(popC.doc_id,popC.doc,popC)};
+document.addEventListener('click',e=>{const b=e.target.closest('.cite');if(!b)return;const c=cite(b);if(c&&c.url)window.open(c.url,'_blank','noopener');else if(c)openViewer(c.doc_id,c.doc,c)});
 
 /* ---------- source viewer (replaces the source list) ---------- */
 function closeViewer(){$('#viewer').style.display='none';$('#srcList').style.display='flex'}
@@ -289,7 +297,7 @@ $('#back').onclick=closeViewer;
 /* ---------- studio + notes ---------- */
 const IC={Summary:'M4 6h16M4 12h16M4 18h10','Study guide':'M4 5a2 2 0 0 1 2-2h12v16H6a2 2 0 0 0-2 2zM4 5v16',FAQ:'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .8-1 1.5M12 17v.5',Timeline:'M12 3v18M12 7h6M12 12H6M12 17h6',Quiz:'M5 7l2 2 3-3M5 15l2 2 3-3M13 8h6M13 16h6',Flashcards:'M4 8h13v11H4zM8 4h13v11'};
 const P={Summary:'Write a structured summary of the selected sources.','Study guide':'Create a study guide with key concepts and review questions.',FAQ:'Write an FAQ with the 8 most useful questions and answers.',Timeline:'Build a timeline of the main events or steps.',Quiz:'Write a 6-question multiple-choice quiz with answers.',Flashcards:'Create 10 flashcards (term and definition).'};
-Object.keys(P).forEach(n=>{const b=document.createElement('button');b.className='tool';b.innerHTML=`<svg viewBox="0 0 24 24"><path d="${IC[n]}"/></svg>${n}`;b.onclick=()=>ask(P[n]);$('#tools').appendChild(b)});
+Object.keys(P).forEach(n=>{const b=document.createElement('button');b.className='tool';b.innerHTML=`<svg viewBox="0 0 24 24"><path d="${IC[n]}"/></svg>${n}`;b.onclick=()=>ask(P[n],true);$('#tools').appendChild(b)});
 function saveNotes(){store.set('notes:'+st.nid,st.notes);renderNotes()}
 function renderNotes(){
   $('#notes').innerHTML=st.notes.length?'':'<p class="mute" style="margin-top:16px">Use “Save to note” under an answer, or add your own.</p>';

@@ -73,6 +73,13 @@ PRICE_OUT = _float("PRICE_OUT", 0.50)
 HISTORY_TURNS = _int("HISTORY_TURNS", 6)
 SUGGESTIONS = _bool("SUGGESTIONS", True)     # 3 follow-up question cards under each answer (one small extra LLM call)
 
+# ---------- Web search (optional) ----------
+# Used only when a question is not covered by the ticked sources. "" = off (answers then come from general knowledge).
+WEB_SEARCH_PROVIDER = _env("WEB_SEARCH_PROVIDER", "").strip().lower()   # "brave" or "tavily"
+WEB_SEARCH_API_KEY = _env("WEB_SEARCH_API_KEY", "")
+WEB_SEARCH_RESULTS = _int("WEB_SEARCH_RESULTS", 5)
+WEB_SEARCH_TIMEOUT = _int("WEB_SEARCH_TIMEOUT", 15)
+
 # ---------- Guardrails ----------
 GUARDRAILS_ENABLED = _bool("GUARDRAILS_ENABLED", True)
 MODERATION_MODEL = _env("MODERATION_MODEL", "omni-moderation-latest")
